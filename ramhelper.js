@@ -4,11 +4,8 @@
   const LS_KEY  = 'RH_barbWalls'; // { "486|453": {wall:6,id:12345,ts:...}, ... }
   const CFG_KEY = 'RH_cfg';       // instellingen (ui + planner)
 
-
   console.log('%c[RamHelper] geladen!', 'color: green; font-weight:bold;');
 alert('RamHelper geladen!');
-
-  
   
   // =============== Helpers ===============
   const htmlEscape = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -45,7 +42,7 @@ alert('RamHelper geladen!');
         B: 2,
         minRams: 4,      // ondergrens
         spies: 1,        // scouts per aanval
-        onlyWalls>0: true // alleen barbs met muur>0
+        onlyWalls: true // alleen barbs met muur>0
       }
     };
     try { return Object.assign(d, JSON.parse(localStorage.getItem(CFG_KEY)||'{}')); }
@@ -59,6 +56,28 @@ alert('RamHelper geladen!');
     const idx = Math.max(0, Math.min(arr.length-1, w));
     return arr[idx] || arr[arr.length-1];
   };
+  // =============== Function to make sure Screen appears  ===============
+function ensureBoxVisible() {
+  const box = document.getElementById('rh-box');
+  if (!box) return;
+
+  // Onzichtbaar of weggedrukt? Forceer zichtbaarheid.
+  const zeroSize = (box.offsetWidth === 0 || box.offsetHeight === 0);
+  const hidden   = (getComputedStyle(box).display === 'none');
+
+  if (zeroSize || hidden) {
+    box.style.display   = 'block';
+    box.style.visibility= 'visible';
+    box.style.position  = 'fixed';
+    box.style.top       = box.style.top || '64px';
+    box.style.right     = box.style.right || '24px';
+    box.style.width     = box.style.width || '920px';
+    box.style.maxHeight = box.style.maxHeight || '86vh';
+    box.style.zIndex    = box.style.zIndex || '2147483647';
+  }
+}
+
+  
 
   // =============== UI container (TW-stijl) ===============
   function ensureFrame() {
@@ -93,6 +112,17 @@ alert('RamHelper geladen!');
     `;
     document.body.appendChild(box);
 
+    
+// Watcher to reset box when visibility changes
+(function installVisibilityWatchdog(){
+  const obs = new MutationObserver(() => ensureBoxVisible());
+  obs.observe(document.body, { childList: true, subtree: true });
+  // ook bij resize of scroll (soms verspringt fixed-layer stacking)
+  window.addEventListener('resize', ensureBoxVisible, { passive: true });
+  window.addEventListener('scroll', ensureBoxVisible, { passive: true });
+})();
+
+    
     // Drag
     (function drag(){
       const head=box.querySelector('#rh-head');
@@ -112,6 +142,16 @@ alert('RamHelper geladen!');
         else renderScanData();
       };
     });
+
+    // Force visible fallback (voor TW CSS bugs)
+box.style.display = 'block';
+box.style.visibility = 'visible';
+box.style.position = 'fixed';
+box.style.top = box.style.top || '64px';
+box.style.right = box.style.right || '24px';
+box.style.width = box.style.width || '920px';
+box.style.maxHeight = box.style.maxHeight || '80vh';
+box.style.zIndex = box.style.zIndex || '2147483647';
 
     return box;
   }
@@ -329,7 +369,7 @@ alert('RamHelper geladen!');
     const body = box.querySelector('#rh-body');
     const cfg  = loadCfg();
     const plan = cfg.planner || (cfg.planner = {
-      maxRadius: 25, minWall: 1, A: 1.5, B: 2, minRams: 4, spies: 1, onlyWalls>0: true
+      maxRadius: 25, minWall: 1, A: 1.5, B: 2, minRams: 4, spies: 1, onlyWalls: true
     });
     saveCfg(cfg);
 
@@ -350,7 +390,7 @@ alert('RamHelper geladen!');
           <label>Scouts/aanval<br><input id="pl-spy" type="number" min="0" max="5" value="${plan.spies}" style="width:100%"></label>
         </div>
         <div style="margin-top:8px;display:flex;align-items:center;gap:12px;">
-          <label><input id="pl-onlywalls" type="checkbox" ${plan.onlyWalls>0?'checked':''}> Plan alleen barbs met muur &gt; 0</label>
+          <label><input id="pl-onlywalls" type="checkbox" ${plan.onlywalls?'checked':''}> Plan alleen barbs met muur &gt; 0</label>
           <div style="flex:1"></div>
           <button id="pl-save"  style="background:#6a8e3a;border:none;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;">Opslaan</button>
           <button id="pl-plan"  style="background:#b2773a;border:none;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;">Plan ramaanvallen</button>
@@ -373,7 +413,7 @@ alert('RamHelper geladen!');
     if (keys.length){
       keys.forEach(k=>{
         const e = map[k]; if (!e || typeof e.wall!=='number') return;
-        if (plan.onlyWalls>0 && e.wall<=0) return;
+        if (plan.onlywalls && e.wall<=0) return;
         if (e.wall < plan.minWall) return;
 
         const [x,y] = k.split('|').map(Number);
@@ -430,7 +470,7 @@ alert('RamHelper geladen!');
         p.B         = +document.getElementById('pl-B').value     || p.B;
         p.minRams   = +document.getElementById('pl-minR').value  || p.minRams;
         p.spies     = +document.getElementById('pl-spy').value   || p.spies;
-        p.onlyWalls>0 = !!document.getElementById('pl-onlywalls').checked;
+        p.onlyWalls = !!document.getElementById('pl-onlywalls').checked;
         saveCfg(c);
         renderPlanner();
       };
@@ -449,4 +489,13 @@ alert('RamHelper geladen!');
 
   // Start op Planner-tab voor directe test
   renderPlanner();
+
+  // direct na het opbouwen van body.innerHTML en het registreren van events:
+ensureBoxVisible();
+
+// extra: na korte delay nog een keer (de ‘race condition’ met TW-UI tackelen)
+setTimeout(ensureBoxVisible, 50);
+setTimeout(ensureBoxVisible, 300);
+
 })();
+
