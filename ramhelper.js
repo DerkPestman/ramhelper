@@ -4,6 +4,12 @@
   const LS_KEY  = 'RH_barbWalls'; // { "486|453": {wall:6,id:12345,ts:...}, ... }
   const CFG_KEY = 'RH_cfg';       // instellingen (ui + planner)
 
+
+  console.log('%c[RamHelper] geladen!', 'color: green; font-weight:bold;');
+alert('RamHelper geladen!');
+
+  
+  
   // =============== Helpers ===============
   const htmlEscape = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   const getParam = (u, k) => {
