@@ -1,25 +1,19 @@
 (() => {
 /* ============================================================
-   FarmManager v1.4  (NL)
-   - FA-only integratie bovenaan Farm Assistent
-   - Scan overlay (auto-start, auto-close), scanLimit instelbaar
-   - Presets A/B live uit FA-sjablonen; C (editable) + optioneel D
-   - Resultaten: Coords, Muur, Afstand, Duur, Rammen, Laatst aangevallen, Actie
-   - Actieknoppen verticaal (A/B/C) in rechterkolom
-   - C alleen als muur>0 (en optioneel verlies) → rammen + 1 scout
-   - Duur = afstand * (min/veld langzaamste unit) / (worldSpeed * unitSpeed)
-   - Legaal: opent alleen place-formulieren in nieuwe tab; geen auto-submit
+   FarmManager v1.5  (NL)
    ============================================================ */
 
 const APP = {
-  VER: '1.4',
+  VER: '1.5',
   KEYS: {
     cfg:     'FM_cfg',
-    walls:   'FM_walls',
-    presets: 'FM_presets', // alleen C (+ optionele D) staan hier
-    meta:    'FM_meta'     // { lastScanTs }
+    walls:   'FM_walls',    // { "x|y": {wall, loss(0/1), dead(0/1), full(0/1), lastTs, id, ts, isBarb(1/0)} }
+    presets: 'FM_presets',  // { C: {...}, D?: {...} }
+    meta:    'FM_meta',     // { lastScanTs }
+    units:   'FM_units'     // { "<villageId>": { spear:.., sword:.., ... } }
   },
   SCAN: { CONCURRENCY: 3, DELAY_MIN: 300, DELAY_MAX: 500, DEFAULT_LIMIT: 50 },
+  PLACE: { CONCURRENCY: 3, DELAY_MIN: 200, DELAY_MAX: 350 },
   qs: (s,r=document)=>r.querySelector(s),
   qsa:(s,r=document)=>Array.from(r.querySelectorAll(s)),
 };
@@ -28,12 +22,10 @@ const APP = {
 function defaultCfg(){
   const wallMap={1:8,2:12,3:16,4:20,5:24,6:28,7:32,8:36,9:40,10:44,11:48,12:52,13:56,14:60,15:64,16:68,17:72,18:76,19:80,20:84};
   return {
-    bannerShown:true,
     filters:{ maxDist:25, minMinutesBetween:5, sort:'dist_then_wall' },
     logic:{
-      addNewBarbs:true,
-      addRamsOnWall:true,    // C activeert rammen bij muur>0
-      onlyOnLoss:true,       // C alleen bij verlies-rapporten
+      addRamsOnWall:true,    // C zichtbaar bij muur>0
+      onlyOnLoss:true,       // C alleen tonen bij (gedeeltelijke) verliezen
       useBWhenFull:true      // B bij volle buit
     },
     wallMap,
@@ -56,6 +48,8 @@ const loadPresets=()=>{try{return Object.assign(defaultPresets(),JSON.parse(loca
 const savePresets=(p)=>localStorage.setItem(APP.KEYS.presets,JSON.stringify(p));
 const loadMeta=()=>{try{return Object.assign(defaultMeta(),JSON.parse(localStorage.getItem(APP.KEYS.meta)||'{}'));}catch{return defaultMeta();}};
 const saveMeta=(m)=>localStorage.setItem(APP.KEYS.meta,JSON.stringify(m));
+const loadUnits=()=>{try{return JSON.parse(localStorage.getItem(APP.KEYS.units)||'{}');}catch{return{};}};
+const saveUnits=(u)=>localStorage.setItem(APP.KEYS.units,JSON.stringify(u));
 
 // ---------- utils ----------
 const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
@@ -67,6 +61,10 @@ const dist=(a,b)=>Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2);
 function myCoords(){
   const t=document.body.innerText||''; const m=t.match(/\b(\d{3})\|(\d{3})\b/);
   return m?{x:+m[1],y:+m[2]}:null;
+}
+function myVillageId(){
+  const m=location.search.match(/[?&]village=(\d+)/);
+  return m?m[1]:'';
 }
 function fmtDateTime(ts){
   if(!ts) return '–';
@@ -99,7 +97,6 @@ const BASE_MIN_PER_FIELD = {
   ram:30, catapult:30, knight:10, noble:35
 };
 function minutesPerFieldForPreset(preset){
-  // langzaamste (max) min/veld
   let maxMin = 0;
   Object.entries(preset||{}).forEach(([u,c])=>{
     if(!c) return;
@@ -111,10 +108,11 @@ function minutesPerFieldForPreset(preset){
 }
 function formatDurationMinutes(mins){
   const totalSec = Math.round(mins*60);
-  const mm = Math.floor(totalSec/60);
+  const hh = Math.floor(totalSec/3600);
+  const mm = Math.floor((totalSec%3600)/60);
   const ss = totalSec%60;
   const pad=n=>String(n).padStart(2,'0');
-  return `${pad(mm)}:${pad(ss)}`;
+  return (hh?`${pad(hh)}:`:'')+`${pad(mm)}:${pad(ss)}`;
 }
 
 // ============================================================
@@ -127,25 +125,26 @@ function injectStyles(){
   st.textContent=`
   .fm-btn{background:${C.btn};border:none;color:#fff;padding:4px 8px;border-radius:6px;cursor:pointer;font:12px Verdana;transition:background .12s}
   .fm-btn.small{padding:3px 6px;min-width:28px;text-align:center}
-  .fm-btn:hover{background:${C.btnHover}} /* geen tekstkleur-change */
+  .fm-btn:hover{background:${C.btnHover}}
   .fm-btn:disabled{opacity:.6;cursor:default}
   .fm-input{padding:3px 6px;border:1px solid ${C.border};border-radius:6px;background:#fff}
   .fm-block{margin:8px 0;padding:10px;border:1px solid ${C.border};border-radius:8px;background:${C.bg}}
   .fm-row-v{display:flex;flex-direction:column;gap:6px}
   .fm-table-head{background:${C.head};border-bottom:1px solid ${C.border};font-weight:bold}
   .fm-cell{padding:6px 8px;border-bottom:1px dashed ${C.border}}
-  .fm-grid{display:grid;grid-template-columns:110px 60px 72px 70px 72px 1fr 120px}
-  /* Coords | Muur | Afstand | Duur | Rammen | Laatst aangevallen | Actie */
-  .fm-grid-head{display:grid;grid-template-columns:110px 60px 72px 70px 72px 1fr 120px}
+  .fm-grid{display:grid;grid-template-columns:24px 110px 60px 72px 70px 72px 130px 100px 160px}
+  /* ● | Coords | Muur | Afstand | Duur | Rammen | Laatst aangevallen | Aangeraden | Actie */
+  .fm-grid-head{display:grid;grid-template-columns:24px 110px 60px 72px 70px 72px 130px 100px 160px}
   .fm-link{color:#532; text-decoration:underline; cursor:pointer}
-  .fm-actions{display:flex;flex-direction:column;gap:6px;align-items:flex-end} /* rechts, verticaal A/B/C */
   .fm-ov{position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center}
   .fm-card{width:720px;max-height:86vh;overflow:auto;border-radius:12px;background:${C.bg};border:1px solid ${C.border};box-shadow:0 10px 30px rgba(0,0,0,.45)}
   .fm-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid ${C.border};background:${C.head};border-top-left-radius:12px;border-top-right-radius:12px}
   .fm-body{padding:12px 14px}
-  .fm-urow{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
-  .fm-unit{display:flex;align-items:center;gap:6px}
-  .fm-unit img{width:16px;height:16px;image-rendering:pixelated}
+  .fm-actions{display:flex;flex-direction:row;gap:6px;justify-content:flex-end} /* rechts, horizontaal A/B/C */
+  .fm-dot{width:10px;height:10px;border-radius:50%;display:inline-block;border:1px solid #644}
+  .fm-dot.green{background:#2e9f4f}
+  .fm-dot.yellow{background:#d8a732}
+  .fm-dot.red{background:#c43c2c}
   `;
   document.head.appendChild(st);
 }
@@ -158,17 +157,11 @@ function injectMainBar(){
   const bar=document.createElement('div'); bar.id='fm-mainbar'; bar.className='fm-block';
   const cfg=loadCfg();
   bar.innerHTML=`
-    <div style="margin-bottom:6px;opacity:.85">
-      <span style="display:inline-block;padding:2px 6px;border:1px solid #c7a76a;background:#ecd6ad;border-radius:10px">
-        FarmManager werkt alleen in het Farm Assistent-scherm.
-      </span>
-    </div>
     <div class="fm-row-v">
       <label>Max velden <input id="fm-maxdist" class="fm-input" type="number" min="1" max="200" value="${cfg.filters.maxDist}" style="width:90px"></label>
       <label>Min. minuten tussen farms <input id="fm-minmin" class="fm-input" type="number" min="0" max="1440" value="${cfg.filters.minMinutesBetween}" style="width:90px"></label>
-      <label><input id="fm-onlyloss" type="checkbox" ${cfg.logic.onlyOnLoss?'checked':''}> Rammen bij gedeeltelijke verliezen</label>
+      <label><input id="fm-onlyloss" type="checkbox" ${cfg.logic.onlyOnLoss?'checked':''}> Rammen bij gedeeltelijke verliezen (bepaalt zichtbaarheid van “C”)</label>
       <label><input id="fm-useB" type="checkbox" ${cfg.logic.useBWhenFull?'checked':''}> B-farm bij volle buit</label>
-      <label><input id="fm-addbarbs" type="checkbox" ${cfg.logic.addNewBarbs?'checked':''}> Nieuwe barbs toevoegen</label>
     </div>
     <div style="display:flex;gap:8px;margin-top:8px">
       <button id="fm-scan" class="fm-btn">Scan rapporten</button>
@@ -185,7 +178,6 @@ function injectMainBar(){
     c.filters.minMinutesBetween=clamp(+APP.qs('#fm-minmin').value||0,0,1440);
     c.logic.onlyOnLoss=APP.qs('#fm-onlyloss').checked;
     c.logic.useBWhenFull=APP.qs('#fm-useB').checked;
-    c.logic.addNewBarbs=APP.qs('#fm-addbarbs').checked;
     saveCfg(c); setStatus('Instellingen opgeslagen ✔️'); renderResults(); setTimeout(()=>setStatus(''),1200);
   };
   APP.qs('#fm-settings').onclick=()=>openSettingsOverlay();
@@ -200,7 +192,7 @@ function injectResultsBlock(){
   const box=document.createElement('div'); box.id='fm-results'; box.className='fm-block';
   box.innerHTML=`
     <div class="fm-table-head fm-grid-head" style="padding:6px 8px;border-top-left-radius:8px;border-top-right-radius:8px">
-      <div>Coords</div><div>Muur</div><div>Afstand</div><div>Duur</div><div>Rammen</div><div>Laatst aangevallen</div><div style="text-align:right;padding-right:12px">Actie</div>
+      <div></div><div>Coords</div><div>Muur</div><div>Afstand</div><div>Duur</div><div>Rammen</div><div>Laatst aangevallen</div><div>Aangeraden</div><div style="text-align:right;padding-right:12px">Actie</div>
     </div>
     <div id="fm-res-body"></div>
   `;
@@ -256,7 +248,9 @@ function bindScanOverlay(ov, autoStart){
             const rec=db[got.coords]||{};
             if(typeof got.wall==='number') rec.wall=got.wall;
             if(typeof got.loss==='boolean') rec.loss=got.loss?1:0;
+            if(typeof got.dead==='boolean') rec.dead=got.dead?1:0;
             if(typeof got.full==='boolean') rec.full=got.full?1:0;
+            if(typeof got.isBarb==='number') rec.isBarb=got.isBarb;
             if(got.timeMs) rec.lastTs=got.timeMs;
             if(got.id) rec.id=got.id;
             rec.ts=now();
@@ -269,13 +263,18 @@ function bindScanOverlay(ov, autoStart){
     }
     await Promise.all(Array.from({length:APP.SCAN.CONCURRENCY}, worker));
     saveWalls(db);
+
+    // Troepen voor ALLE dorpen ophalen (place) en cachen
+    st.textContent='Verzamelplaatsgegevens ophalen…';
+    await collectAllVillageUnits();
+
     // markeer als "net gescand" zodat resultaten mogen renderen
     const meta=loadMeta(); meta.lastScanTs=now(); saveMeta(meta);
 
     btnStart.disabled=false; btnCancel.disabled=true;
-    const msg = cancel?`Geannuleerd. Verwerkt: ${done}/${max}, bijgewerkt: ${updated}`:`Klaar. Verwerkt: ${done}/${max}, bijgewerkt: ${updated}`;
+    const msg = cancel?`Geannuleerd.`:`Klaar. Gegevens bijgewerkt.`;
     st.textContent = msg; setStatus('Scan voltooid'); renderResults();
-    // auto close na 800ms (ook expliciet zoals gevraagd)
+    // auto close na 800ms
     setTimeout(()=>{ if(document.body.contains(ov)) ov.remove(); }, 800);
   }
 
@@ -309,10 +308,10 @@ function renderSettings(root){
     return `
     <fieldset style="border:1px solid #c7a76a;border-radius:8px;padding:8px 10px">
       <legend style="padding:0 6px">Preset ${name}</legend>
-      <div class="fm-urow">
+      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px">
         ${unitOrder.map(u => `
-          <label class="fm-unit" title="${labels[u]}">
-            <img src="${icon(u)}" alt="">
+          <label title="${labels[u]}" style="display:flex;align-items:center;gap:6px">
+            <img src="${icon(u)}" width="16" height="16" style="image-rendering:pixelated">
             <input data-fm-pre="${name}:${u}" class="fm-input" type="number" min="0" value="${toInt(p[u]||0)}" style="width:70px">
           </label>
         `).join('')}
@@ -374,118 +373,33 @@ function renderSettings(root){
 }
 
 // ============================================================
-// Resultatenlijst rendering
-// ============================================================
-function renderResults(){
-  const body=APP.qs('#fm-res-body'); if(!body) return;
-  const cfg=loadCfg(); const walls=loadWalls(); const me=myCoords();
-  const meta=loadMeta();
-
-  // Pas na recente scan tonen
-  if(!meta.lastScanTs){ body.innerHTML=`<div class="fm-cell" style="padding:8px">Nog geen gegevens. Klik <b>Scan rapporten</b> om te starten.</div>`; return; }
-
-  const items=[];
-  Object.keys(walls).forEach(k=>{
-    const rec=walls[k]; if(typeof rec.wall!=='number' && !rec.lastTs) return;
-    const [x,y]=k.split('|').map(Number);
-    const it={coords:k,x,y,id:rec.id||null,wall:rec.wall|0,loss:!!rec.loss,full:!!rec.full,lastTs:rec.lastTs||0};
-    it.dist=me? +dist(me,it).toFixed(2) : null;
-    items.push(it);
-  });
-
-  const maxD=cfg.filters.maxDist|0, minGap=cfg.filters.minMinutesBetween|0;
-  const list=items.filter(it=>{
-    if(me && maxD && it.dist!=null && it.dist>maxD) return false;
-    if(minGap>0 && it.lastTs && ( (Date.now()-it.lastTs)/60000 < minGap) ) return false;
-    return true;
-  });
-
-  list.sort((a,b)=>{
-    if(cfg.filters.sort==='wall_then_dist'){ if(b.wall!==a.wall) return b.wall-a.wall; return (a.dist??999)-(b.dist??999);}
-    if((a.dist??999)!==(b.dist??999)) return (a.dist??999)-(b.dist??999);
-    return b.wall-a.wall;
-  });
-
-  function barbLink(it){
-    if(it.id) return `game.php?screen=info_village&id=${it.id}`;
-    return `game.php?screen=info_village&x=${it.x}&y=${it.y}`;
-  }
-  function ramsFor(it){
-    const use = cfg.logic.addRamsOnWall && it.wall>0 && (!cfg.logic.onlyOnLoss || it.loss);
-    return use ? (cfg.wallMap[it.wall]||0) : 0;
-  }
-
-  body.innerHTML = list.map(it=>{
-    const rams=ramsFor(it);
-    const last = fmtDateTime(it.lastTs);
-
-    // Presets
-    const A = readFAPreset('A');
-    const B = readFAPreset('B');
-    const Cbase = loadPresets().C || {};
-    const C = rams>0 ? withRamsAndScout(Cbase, rams) : null;
-
-    // Duur: volgens langzaamste unit van preset A (representatief)
-    const durA = it.dist!=null ? formatDurationMinutes( (+it.dist) * minutesPerFieldForPreset(A) ) : '–';
-
-    return `
-      <div class="fm-grid">
-        <div class="fm-cell"><a class="fm-link" target="_blank" href="${barbLink(it)}">[${it.coords}]</a></div>
-        <div class="fm-cell">Lv ${it.wall}${it.loss?'*':''}</div>
-        <div class="fm-cell">${it.dist!=null?it.dist:'?'}</div>
-        <div class="fm-cell">${durA}</div>
-        <div class="fm-cell">${rams}</div>
-        <div class="fm-cell">${last}</div>
-        <div class="fm-cell">${actionBtns(it, A, B, C)}</div>
-      </div>
-    `;
-  }).join('') || `<div class="fm-cell" style="padding:8px">Geen resultaten. Scan rapporten of pas filters aan.</div>`;
-}
-
-function withRamsAndScout(base, rams){
-  const u=JSON.parse(JSON.stringify(base||{})); u.ram=(u.ram|0)+rams; u.spy=(u.spy|0)+1; return u;
-}
-
-function actionBtns(it, A, B, C){
-  const vid = new URL(location.href).searchParams.get('village')||'';
-  const urlA = buildPlaceUrl(vid, it.x, it.y, A);
-  const urlB = buildPlaceUrl(vid, it.x, it.y, B);
-  const urlC = C ? buildPlaceUrl(vid, it.x, it.y, C) : null;
-
-  const titleA=compTitle(A), titleB=compTitle(B), titleC=urlC?compTitle(C):'';
-
-  return `
-    <div class="fm-actions">
-      <a class="fm-btn small" title="${titleA}" target="_blank" href="${urlA}">A</a>
-      <a class="fm-btn small" title="${titleB}" target="_blank" href="${urlB}">B</a>
-      ${urlC?`<a class="fm-btn small" title="${titleC}" target="_blank" href="${urlC}">C</a>`:''}
-    </div>
-  `;
-}
-
-// ============================================================
-// FA sjablonen A/B live uitlezen (robuuste parser)
+// Hulp: FA-sjablonen A/B uitlezen + titel
 // ============================================================
 function readFAPreset(letter){
-  // Zoek “Sjabloon”-tabel
   const table = APP.qsa('table').find(t=>/Sjabloon/i.test(t.innerText||''));
   const units=['spear','sword','axe','archer','spy','light','heavy','marcher','ram','catapult','knight'];
   const out={}; units.forEach(u=>out[u]=0);
   if(!table) return out;
 
   const rows=APP.qsa('tr',table);
-  // rij waar eerste cel exact 'A' of 'B' is
   const row=rows.find(r=>((r.cells?.[0]?.innerText||'').trim()===letter));
   if(!row){ return out; }
 
-  // inputs op volgorde kolommen
   const inputs=APP.qsa('input',row).filter(inp=>inp.type==='text' || inp.type==='number');
   inputs.forEach((inp,i)=>{ if(i<units.length) out[units[i]]=toInt(inp.value); });
   return out;
 }
+function compTitle(units){
+  const order=['spy','light','axe','spear','sword','heavy','archer','marcher','ram','catapult','knight'];
+  const names={spy:'Verkenner',light:'LC',axe:'Bijl',spear:'Speer',sword:'Zwaard',heavy:'ZC',archer:'Boog',marcher:'Ruiterboog',ram:'Ram',catapult:'Kata',knight:'Ridder'};
+  const parts=[]; order.forEach(k=>{const v=units[k]|0; if(v>0) parts.push(`${names[k]}: ${v}`);}); return parts.length?`Stuurt: ${parts.join(', ')}`:'Stuurt: (geen)';
+}
+function withRamsAndScout(base, rams){
+  const u=JSON.parse(JSON.stringify(base||{})); u.ram=(u.ram|0)+rams; u.spy=(u.spy|0)+1; return u;
+}
 
 // ============================================================
-// Report parsing
+// Report parsing  (herken barb + verliesstatus + deadAll + full + tijd)
 // ============================================================
 function parseReport(html){
   const doc=new DOMParser().parseFromString(html,'text/html');
@@ -502,30 +416,222 @@ function parseReport(html){
   const mc=txt.match(/\b(\d{3})\|(\d{3})\b/); const coords=mc?mc[1]+'|'+mc[2]:null;
   // id
   let id=null; const vlink=APP.qs('a[href*="screen=info_village"][href*="id="]',doc); if(vlink){ const m=vlink.href.match(/id=(\d+)/); if(m) id=m[1]; }
-  // verlies-indicator
-  let loss=false; if(/Verliezen|Losses/i.test(txt)){ const m=txt.match(/Verliezen[^0-9]*(\d+)/i); loss = m? (parseInt(m[1],10)>0) : /verlies|verloren/i.test(txt); }
+  // barb?
+  const isBarb = /Barbarendorp|Barbarian\s+village/i.test(txt) ? 1 : 0;
+  // verlies-indicatoren
+  let loss=false, deadAll=false;
+  if(/verliezen|losses/i.test(txt)){
+    const deadMsg = /(volledige nederlaag|alle.*gesneuveld|all (?:your )?troops (?:have )?died)/i.test(txt);
+    deadAll = !!deadMsg;
+    const anyLoss = /verliezen[^0-9]*([1-9]\d*)/i.test(txt) || /losses[^0-9]*([1-9]\d*)/i.test(txt);
+    loss = anyLoss || deadAll;
+  }
   // full haul
   const full=/Volledige buit|Full haul|Volle buit/i.test(txt);
   // tijd
   let timeMs=null;
   const d1=txt.match(/(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})\s+(\d{2}:\d{2}(?::\d{2})?)/);
   if(d1){ const d=d1[1].replace(/\./g,'-').replace(/\//g,'-'); const iso=(/\d{4}-/.test(d)?d:d.split('-').reverse().join('-'))+'T'+d1[2]; const t=Date.parse(iso); if(!isNaN(t)) timeMs=t; }
-  return {coords,wall,loss,full,timeMs,id};
+  return {coords,wall,loss,dead:deadAll,full,timeMs,id,isBarb};
 }
 
 // ============================================================
-// Build place URL + titles
+// Village discovery + units via place
 // ============================================================
-function compTitle(units){
-  const order=['spy','light','axe','spear','sword','heavy','archer','marcher','ram','catapult','knight'];
-  const names={spy:'Verkenner',light:'LC',axe:'Bijl',spear:'Speer',sword:'Zwaard',heavy:'ZC',archer:'Boog',marcher:'Ruiterboog',ram:'Ram',catapult:'Kata',knight:'Ridder'};
-  const parts=[]; order.forEach(k=>{const v=units[k]|0; if(v>0) parts.push(`${names[k]}: ${v}`);}); return parts.length?`Stuurt: ${parts.join(', ')}`:'Stuurt: (geen)';
+function discoverVillageIds(){
+  // beste poging: zoek alle links met &village=... in top/breadcrumbs etc.
+  const ids=new Set();
+  const links=APP.qsa('a[href*="village="]');
+  links.forEach(a=>{
+    const m=a.href.match(/[?&]village=(\d+)/);
+    if(m) ids.add(m[1]);
+  });
+  // altijd huidige
+  const cur=myVillageId(); if(cur) ids.add(cur);
+  return Array.from(ids);
 }
-function buildPlaceUrl(villageId,x,y,units){
-  const p=new URLSearchParams(); p.set('village',villageId); p.set('screen','place'); p.set('x',x); p.set('y',y);
-  const map={spear:'spear',sword:'sword',axe:'axe',archer:'archer',spy:'spy',light:'light',heavy:'heavy',marcher:'marcher',ram:'ram',catapult:'catapult',knight:'knight'};
-  Object.keys(map).forEach(k=>{ const v=units[k]|0; if(v>0) p.set(map[k],String(v)); });
-  return 'game.php?'+p.toString();
+async function fetchPlaceUnits(villageId){
+  try{
+    const url=`game.php?village=${villageId}&screen=place`;
+    const html=await (await fetch(url,{credentials:'same-origin'})).text();
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const map={spear:0,sword:0,axe:0,archer:0,spy:0,light:0,heavy:0,marcher:0,ram:0,catapult:0,knight:0};
+    Object.keys(map).forEach(k=>{
+      const inp=doc.querySelector(`#unit_input_${k}`) || doc.querySelector(`input[name="${k}"]`);
+      if(inp){ const max=(inp.getAttribute('data-all-count')||inp.getAttribute('data-max')||inp.getAttribute('data-available')||'0')|0; map[k]=max; }
+      else{
+        // fallback: tekst naast icoon
+        const img=Array.from(doc.querySelectorAll('img[src*="unit_'+k+'"]'))[0];
+        if(img){
+          const cell=img.closest('td,span,div'); const m=(cell?.innerText||'').match(/(\d+)/); if(m) map[k]=+m[1];
+        }
+      }
+    });
+    return map;
+  }catch(e){ return null; }
+}
+async function collectAllVillageUnits(){
+  const ids=discoverVillageIds();
+  const out={}; let idx=0;
+  async function worker(){
+    while(idx<ids.length){
+      const i=idx++, vid=ids[i];
+      const got=await fetchPlaceUnits(vid);
+      if(got) out[vid]=got;
+      await sleep(rint(APP.PLACE.DELAY_MIN, APP.PLACE.DELAY_MAX));
+    }
+  }
+  await Promise.all(Array.from({length:APP.PLACE.CONCURRENCY}, worker));
+  saveUnits(out);
+  return out;
+}
+
+// ============================================================
+// Resultatenlijst rendering
+// ============================================================
+function renderResults(){
+  const body=APP.qs('#fm-res-body'); if(!body) return;
+  const cfg=loadCfg(); const walls=loadWalls(); const me=myCoords();
+  const meta=loadMeta();
+  const unitsByVid=loadUnits();
+
+  if(!meta.lastScanTs){ body.innerHTML=`<div class="fm-cell" style="padding:8px">Nog geen gegevens. Klik <b>Scan rapporten</b> om te starten.</div>`; return; }
+
+  const items=[];
+  Object.keys(walls).forEach(k=>{
+    const rec=walls[k];
+    if(!rec || !rec.isBarb) return; // alleen barbs
+    const [x,y]=k.split('|').map(Number);
+    const it={coords:k,x,y,id:rec.id||null,wall:rec.wall|0,loss:!!rec.loss,dead:!!rec.dead,full:!!rec.full,lastTs:rec.lastTs||0};
+    it.dist=me? +dist(me,it).toFixed(2) : null;
+    items.push(it);
+  });
+
+  const maxD=cfg.filters.maxDist|0, minGap=cfg.filters.minMinutesBetween|0;
+  let list=items.filter(it=>{
+    if(me && maxD && it.dist!=null && it.dist>maxD) return false;
+    if(minGap>0 && it.lastTs && ( (Date.now()-it.lastTs)/60000 < minGap) ) return false;
+    return true;
+  });
+
+  // Presets
+  const presetA = readFAPreset('A');
+  const presetB = readFAPreset('B');
+  const pCbase  = loadPresets().C || {};
+
+  // helper: isNonZero preset?
+  const hasTroops = (p)=>Object.values(p||{}).some(v=> (v|0) > 0);
+
+  // Voor elke barb: check of minstens één preset haalbaar is in een of meer dorpen
+  function villageCandidatesFor(preset){
+    const vids = Object.keys(unitsByVid||{});
+    const ok=[];
+    vids.forEach(vid=>{
+      const avail=unitsByVid[vid];
+      if(canFillPreset(avail, preset)) ok.push(vid);
+    });
+    return ok;
+  }
+  function canFillPreset(avail, preset){
+    if(!avail||!preset) return false;
+    for(const [u,need] of Object.entries(preset)){
+      if((need|0)>0 && (avail[u]|0) < (need|0)) return false;
+    }
+    return true;
+  }
+
+  // filter rows zonder enkele optie
+  list=list.filter(it=>{
+    const rams = cfg.logic.addRamsOnWall && it.wall>0 && (!cfg.logic.onlyOnLoss || it.loss) ? (cfg.wallMap[it.wall]||0) : 0;
+    const C = rams>0 ? withRamsAndScout(pCbase, rams) : null;
+
+    const Aok = hasTroops(presetA) && villageCandidatesFor(presetA).length>0;
+    const Bok = hasTroops(presetB) && villageCandidatesFor(presetB).length>0;
+    const Cok = C && villageCandidatesFor(C).length>0;
+
+    return (Aok || Bok || Cok);
+  });
+
+  // sortering
+  list.sort((a,b)=>{
+    if(cfg.filters.sort==='wall_then_dist'){ if(b.wall!==a.wall) return b.wall-a.wall; return (a.dist??999)-(b.dist??999);}
+    if((a.dist??999)!==(b.dist??999)) return (a.dist??999)-(b.dist??999);
+    return b.wall-a.wall;
+  });
+
+  function barbLink(it){
+    if(it.id) return `game.php?screen=info_village&id=${it.id}`;
+    return `game.php?screen=info_village&x=${it.x}&y=${it.y}`;
+  }
+  function ramsFor(it){
+    const use = cfg.logic.addRamsOnWall && it.wall>0 && (!cfg.logic.onlyOnLoss || it.loss);
+    return use ? (cfg.wallMap[it.wall]||0) : 0;
+  }
+  function recDotClass(it){
+    if(it.dead) return 'red';
+    if(it.loss) return 'yellow';
+    return 'green';
+  }
+  function recommended(it){
+    if(cfg.logic.useBWhenFull && it.full) return 'Preset B';
+    if(it.wall>0 || it.loss) return 'Preset C';
+    return 'Preset A';
+  }
+  function firstVillageFor(preset){
+    const vids=Object.keys(unitsByVid||{});
+    for(const vid of vids){
+      if(canFillPreset(unitsByVid[vid], preset)) return vid;
+    }
+    return null;
+  }
+  function buildPlaceUrl(villageId,x,y,units){
+    const p=new URLSearchParams(); p.set('village',villageId); p.set('screen','place'); p.set('x',x); p.set('y',y);
+    const map={spear:'spear',sword:'sword',axe:'axe',archer:'archer',spy:'spy',light:'light',heavy:'heavy',marcher:'marcher',ram:'ram',catapult:'catapult',knight:'knight'};
+    Object.keys(map).forEach(k=>{ const v=units[k]|0; if(v>0) p.set(map[k],String(v)); });
+    return 'game.php?'+p.toString();
+  }
+
+  body.innerHTML = list.map(it=>{
+    const rams=ramsFor(it);
+    const C = rams>0 ? withRamsAndScout(pCbase, rams) : null;
+
+    // kies village per preset
+    const vidA = hasTroops(presetA) ? firstVillageFor(presetA) : null;
+    const vidB = hasTroops(presetB) ? firstVillageFor(presetB) : null;
+    const vidC = C ? firstVillageFor(C) : null;
+
+    // duur o.b.v. A (als die bestaat), anders B, anders C
+    const presetForTime = (vidA?presetA:(vidB?presetB:(vidC?C:null)));
+    const dur = it.dist!=null ? formatDurationMinutes( (+it.dist) * minutesPerFieldForPreset(presetForTime||presetA) ) : '–';
+
+    const urlA = vidA ? buildPlaceUrl(vidA, it.x, it.y, presetA) : null;
+    const urlB = vidB ? buildPlaceUrl(vidB, it.x, it.y, presetB) : null;
+    const urlC = (C && vidC) ? buildPlaceUrl(vidC, it.x, it.y, C) : null;
+
+    const titleA=vidA?compTitle(presetA):'';
+    const titleB=vidB?compTitle(presetB):'';
+    const titleC=(C&&vidC)?compTitle(C):'';
+
+    return `
+      <div class="fm-grid">
+        <div class="fm-cell"><span class="fm-dot ${recDotClass(it)}" title="${it.dead?'Volledige nederlaag':(it.loss?'Gedeeltelijke verliezen':'Geen verliezen')}"></span></div>
+        <div class="fm-cell"><a class="fm-link" target="_blank" href="${barbLink(it)}">[${it.coords}]</a></div>
+        <div class="fm-cell">Lv ${it.wall}${it.loss?'*':''}</div>
+        <div class="fm-cell">${it.dist!=null?it.dist:'?'}</div>
+        <div class="fm-cell">${dur}</div>
+        <div class="fm-cell">${rams}</div>
+        <div class="fm-cell">${fmtDateTime(it.lastTs)}</div>
+        <div class="fm-cell">${recommended(it)}</div>
+        <div class="fm-cell">
+          <div class="fm-actions">
+            ${urlA?`<a class="fm-btn small" title="${titleA}" target="_blank" href="${urlA}">A</a>`:''}
+            ${urlB?`<a class="fm-btn small" title="${titleB}" target="_blank" href="${urlB}">B</a>`:''}
+            ${urlC?`<a class="fm-btn small" title="${titleC}" target="_blank" href="${urlC}">C</a>`:''}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('') || `<div class="fm-cell" style="padding:8px">Geen barbs binnen je filters of zonder beschikbare troepen.</div>`;
 }
 
 // ============================================================
@@ -541,7 +647,9 @@ async function autoCaptureIfSingleReport(){
       const db=loadWalls(); const rec=db[got.coords]||{};
       if(typeof got.wall==='number') rec.wall=got.wall;
       if(typeof got.loss==='boolean') rec.loss=got.loss?1:0;
+      if(typeof got.dead==='boolean') rec.dead=got.dead?1:0;
       if(typeof got.full==='boolean') rec.full=got.full?1:0;
+      if(typeof got.isBarb==='number') rec.isBarb=got.isBarb;
       if(got.timeMs) rec.lastTs=got.timeMs;
       if(got.id) rec.id=got.id;
       rec.ts=now(); db[got.coords]=rec; saveWalls(db);
@@ -552,11 +660,23 @@ async function autoCaptureIfSingleReport(){
 }
 
 // ============================================================
-// Init
+// Init (inclusief redirect naar FA als je er niet bent)
 // ============================================================
+function redirectIfNotFA(){
+  if(/[?&]screen=am_farm\b/.test(location.search)) return;
+  // probeer village id te behouden; anders laat het spel het bepalen
+  const vid=myVillageId();
+  const target = 'game.php?screen=am_farm' + (vid?('&village='+vid):'');
+  location.href = target;
+}
+
 function init(){
+  // Als je niet op FA staat → stuur je daarheen.
+  if(!/[?&]screen=am_farm\b/.test(location.search)){ redirectIfNotFA(); return; }
+
   injectStyles(); injectMainBar(); injectResultsBlock(); ensureWorldSpeeds(); autoCaptureIfSingleReport();
 }
+
 window.__FarmManager__={init};
 init();
 
